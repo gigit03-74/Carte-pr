@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Supervision PR - Allier v6.0 (Live BD TOPO)</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body { margin: 0; padding: 0; font-family: 'Segoe UI', -apple-system, sans-serif; background: #111827; }
+        #map { height: 100vh; width: 100vw; }
+        .pr-panel {
+            position: absolute; top: 15px; left: 50%; transform: translateX(-50%); z-index: 1000;
+            background: #1f2937; color: white; padding: 14px 28px; border-radius: 16px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.5); text-align: center; min-width: 320px;
+            border: 2px solid #374151; transition: all 0.2s ease;
+        }
+        .pr-display { font-size: 34px; font-weight: 800; color: #10b981; margin: 2px 0; font-family: monospace; }
+        .road-display { font-size: 12px; color: #9ca3af; text-transform: uppercase; font-weight: bold; letter-spacing: 1.5px; }
+        .pr-panel.on { border-color: #10b981; }
+        .pr-panel.on .pr-display { color: #10b981; }
+        .pr-panel.sync { border-color: #3b82f6; }
+        .pr-panel.sync .pr-display { color: #3b82f6; }
+        .pr-panel.off { border-color: #ef4444; }
+        .pr-panel.off .pr-display { color: #ef4444; }
+        .debug-console {
+            position: absolute; bottom: 25px; left: 50%; transform: translateX(-50%); z-index: 1000;
+            background: rgba(17, 24, 39, 0.95); color: #fff; padding: 10px 18px;
+            border-radius: 8px; font-family: monospace; font-size: 11px; width: 85%; max-width: 420px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.6); pointer-events: none; border: 1px solid #374151;
+        }
+        .log-line { margin: 3px 0; display: flex; justify-content: space-between; }
+        .text-green { color: #10b981; } .text-blue { color: #3b82f6; }
+        .text-orange { color: #f59e0b; } .text-red { color: #ef4444; }
+
+        /* Bouton de réactualisation / recentrage GPS */
+        #btn-refresh {
+            position: absolute; bottom: 90px; right: 18px; z-index: 1001;
+            width: 56px; height: 56px; border-radius: 50%; border: none;
+            background: #3b82f6; color: white; font-size: 24px; cursor: pointer;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.5); display: flex;
+            align-items: center; justify-content: center; transition: all 0.15s ease;
+        }
+        #btn-refresh:active { transform: scale(0.92); background: #2563eb; }
+        #btn-refresh.searching { animation: spin 1s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div class="pr-panel" id="hud-panel">
+        <div class="road-display" id="hud-title">CHARGEMENT DE LA BASE...</div>
+        <div class="pr-display" id="hud-value">PR -- + --</div>
+    </div>
+    <div class="debug-console">
+        <div class="log-line"><span id="log-gps">📡 GPS : En attente...</span></div>
+        <div class="log-line"><span id="log-db">📦 BASE CD03 : En attente...</span></div>
+    </div>
+    <div id="map"></div>
+    <button id="btn-refresh" title="Réactualiser la position">📍</button>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        const map = L.map('map', { zoomControl: false }).setView([46.4, 3.1], 9);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+
+        let userMarker = null, userCircle = null;
+        let isInitialFocus = true;
+        let currentLat = null, currentLng = null, currentAccuracy = 10;
+        let smoothLat = null, smoothLng = null;   // position lissée
+        let lastFixTime = 0;
+
+        const globalPRRegistry = new Map();
+        let routesMap = new Map();
+
+        // Géométrie des routes (BD CARTO) : route -> liste de segments {ax,ay,bx,by ...}
+        // Construite après chargement du GeoJSON. Permet de projeter sur le tracé réel.
+        const roadGeometry = new Map();   // route -> [ {lng1,lat1,lng2,lat2} ... ]
+        let geometryReady = false;
+        // Bornes PR projetées sur le tracé (abscisse curviligne calée sur la géométrie)
+        // route -> [ {numero, abscisse(officielle CSV), s(abscisse géométrique m), lat, lng} ]
+        const prOnRoad = new Map();
+
+        // Calque dédié aux bornes PR, rendu Canvas pour la performance (5500+ points)
+        const prRenderer = L.canvas({ padding: 0.5 });
+        const prLayer = L.layerGroup().addTo(map);
+        let prMarkersBuilt = false;
+        const PR_MIN_ZOOM = 13; // n'affiche les bornes qu'à partir de ce zoom
+        const prDotByKey = new Map();   // clé "route_numero" -> circleMarker
+        let activePRKey = null;         // borne actuellement surlignée
+
+        /* Parseur CSV robuste : gère les guillemets et virgules internes */
+        function parseCsvLine(line) {
+            const result = []; let cur = ''; let inQuotes = false;
+            for (let k = 0; k < line.length; k++) {
+                const c = line[k];
+                if (c === '"') {
+                    if (inQuotes && line[k + 1] === '"') { cur += '"'; k++; }
+                    else inQuotes = !inQuotes;
+                } else if (c === ',' && !inQuotes) { result.push(cur); cur = ''; }
+                else { cur += c; }
+            }
+            result.push(cur);
+            return result;
+        }
+
+        function parseNum(str) {
+            if (str === undefined || str === null) return NaN;
+            let s = String(str).replace(/"/g, '').trim();
+            if (s.indexOf('.') === -1 && (s.match(/,/g) || []).length === 1) s = s.replace(',', '.');
+            return parseFloat(s);
+        }
+
+        function chargerBaseLocale() {
+            log('log-db', '📦 BASE CD03 : Chargement...', 'blue');
+            fetch('allier.csv')
+                .then(res => { if (!res.ok) throw new Error("allier.csv introuvable"); return res.text(); })
+                .then(csvText => {
+                    const lines = csvText.split(/\r?\n/);
+                    if (lines.length < 2) return;
+
+                    // Lecture des entêtes par NOM (robuste à l'ordre des colonnes)
+                    const headers = parseCsvLine(lines[0]).map(h => h.trim());
+                    const idxX        = headers.indexOf('X');
+                    const idxY        = headers.indexOf('Y');
+                    const idxRoute    = headers.indexOf('route');
+                    const idxNumero   = headers.indexOf('numero');
+                    const idxAbscisse = headers.indexOf('abscisse');
+                    const idxStatut   = headers.indexOf('statut');
+
+                    if (idxX === -1 || idxY === -1 || idxRoute === -1 || idxNumero === -1 || idxAbscisse === -1) {
+                        throw new Error("Colonnes X,Y,route,numero,abscisse requises");
+                    }
+                    const maxIdx = Math.max(idxX, idxY, idxRoute, idxNumero, idxAbscisse);
+
+                    let count = 0, skippedNonNum = 0;
+                    for (let i = 1; i < lines.length; i++) {
+                        const raw = lines[i].trim();
+                        if (!raw) continue;
+                        const cols = parseCsvLine(raw);
+                        if (cols.length <= maxIdx) continue;
+
+                        let route = cols[idxRoute].replace(/"/g, '').toUpperCase().replace(/\s+/g, '').trim();
+                        // numero peut contenir DS / FS (début/fin de section) -> on ne garde que les entiers
+                        let numStr = cols[idxNumero].replace(/"/g, '').trim();
+                        let numero = parseInt(numStr, 10);
+                        let abscisse = parseNum(cols[idxAbscisse]);   // mètres réels depuis l'origine de la route
+                        let lng = parseNum(cols[idxX]);
+                        let lat = parseNum(cols[idxY]);
+
+                        if (!route.startsWith('D')) continue;
+                        if (isNaN(numero) || String(numero) !== numStr) { skippedNonNum++; continue; }
+                        if (isNaN(lng) || isNaN(lat) || isNaN(abscisse)) continue;
+
+                        const uniqueKey = `${route}_${numero}`;
+                        globalPRRegistry.set(uniqueKey, { route, numero, abscisse, lng, lat });
+                        count++;
+                    }
+
+                    buildRoutesMap();
+                    buildPRMarkers();
+                    toggledPRVisibility();
+                    log('log-db', `📦 BASE CD03 : ${count} PR (${routesMap.size} routes)`, 'green');
+                    updateHUD("BASE PR ACTIVE", "PR 0 + 0", "sync");
+                    if (currentLat && currentLng) processLiveLocation(currentLat, currentLng, currentAccuracy);
+                })
+                .catch(err => {
+                    log('log-db', `❌ BASE : Erreur (${err.message})`, 'red');
+                    updateHUD("ERREUR CHARGEMENT BASE CSV", "PR -- + --", "off");
+                });
+        }
+
+        function buildRoutesMap() {
+            routesMap = new Map();
+            for (let pr of globalPRRegistry.values()) {
+                if (!routesMap.has(pr.route)) routesMap.set(pr.route, []);
+                routesMap.get(pr.route).push(pr);
+            }
+            // Tri par abscisse réelle (et non par numero, plus sûr)
+            routesMap.forEach(points => points.sort((a, b) => a.abscisse - b.abscisse));
+        }
+
+        const LAT_M = 111120;
+        function lngM(lat) { return 111120 * Math.cos(lat * Math.PI / 180); }
+
+        /* Charge le tracé des routes (GeoJSON BD CARTO) et l'indexe par route.
+           Puis projette chaque borne PR sur le tracé pour caler l'abscisse. */
+
+        // --- Chargement LIVE depuis la BD TOPO de l'IGN, par zones, avec cache ---
+        const IGN_WFS = 'https://data.geopf.fr/wfs?SERVICE=WFS&REQUEST=GetFeature&VERSION=2.0.0' +
+                        '&TYPENAMES=BDTOPO_V3:troncon_de_route&OUTPUTFORMAT=application/json&SRSNAME=EPSG:4326&COUNT=5000';
+        const loadedTiles = new Set();      // zones déjà chargées (clé "tileLat_tileLng")
+        const TILE_DEG = 0.05;              // taille d'une zone (~5,5 km) ; on charge la zone + ses voisines
+        let fetchingZone = false;
+        let lastZoneCenter = null;
+
+        function tileKey(lat, lng) {
+            return `${Math.floor(lat / TILE_DEG)}_${Math.floor(lng / TILE_DEG)}`;
+        }
+
+        /* Charge depuis l'IGN les routes autour de (lat,lng) si la zone n'est pas en cache. */
+        function ensureGeometryAround(lat, lng) {
+            const key = tileKey(lat, lng);
+            if (loadedTiles.has(key) || fetchingZone) return;
+
+            // bbox = zone courante + marge, pour couvrir les bords
+            const margin = TILE_DEG;
+            const latMin = Math.floor(lat / TILE_DEG) * TILE_DEG - margin;
+            const lngMin = Math.floor(lng / TILE_DEG) * TILE_DEG - margin;
+            const latMax = latMin + TILE_DEG + 2 * margin;
+            const lngMax = lngMin + TILE_DEG + 2 * margin;
+
+            fetchingZone = true;
+            log('log-db', '🛣️ IGN BD TOPO : chargement zone...', 'blue');
+            const url = `${IGN_WFS}&CQL_FILTER=BBOX(geometrie,${latMin},${lngMin},${latMax},${lngMax})`;
+
+            fetch(url)
+                .then(res => { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
+                .then(geo => {
+                    let added = 0;
+                    for (const feat of (geo.features || [])) {
+                        const num = feat.properties.cpx_numero;
+                        if (!num) continue;
+                        const route = String(num).toUpperCase().replace(/\s+/g, '');
+                        if (!route.startsWith('D')) continue;
+                        const g = feat.geometry;
+                        if (!g) continue;
+                        const lines = g.type === 'LineString' ? [g.coordinates]
+                                    : g.type === 'MultiLineString' ? g.coordinates : [];
+                        if (!roadGeometry.has(route)) roadGeometry.set(route, []);
+                        const arr = roadGeometry.get(route);
+                        for (const line of lines)
+                            for (let k = 0; k < line.length - 1; k++) {
+                                arr.push({ lng1: line[k][0], lat1: line[k][1], lng2: line[k + 1][0], lat2: line[k + 1][1] });
+                                added++;
+                            }
+                    }
+                    loadedTiles.add(key);
+                    recomputeGeometry();
+                    geometryReady = roadGeometry.size > 0;
+                    fetchingZone = false;
+                    log('log-db', `🛣️ BD TOPO : zone OK (+${added} seg, cache ${loadedTiles.size} zones)`, 'green');
+                    if (currentLat && currentLng) processLiveLocation(currentLat, currentLng, currentAccuracy);
+                })
+                .catch(err => {
+                    fetchingZone = false;
+                    // Hors-ligne ou erreur : on garde le cache existant et on continue dessus
+                    if (roadGeometry.size > 0) {
+                        log('log-db', `📴 IGN injoignable — cache (${loadedTiles.size} zones)`, 'orange');
+                    } else {
+                        log('log-db', `📴 IGN injoignable, pas de cache — mode bornes`, 'orange');
+                    }
+                });
+        }
+
+        /* Recalcule abscisses cumulées + projection des bornes après ajout de géométrie. */
+        function recomputeGeometry() {
+            roadGeometry.forEach((segs) => {
+                let cum = 0;
+                for (const s of segs) {
+                    s.s0 = cum;
+                    const dx = (s.lng2 - s.lng1) * lngM((s.lat1 + s.lat2) / 2);
+                    const dy = (s.lat2 - s.lat1) * LAT_M;
+                    s.len = Math.sqrt(dx * dx + dy * dy);
+                    cum += s.len;
+                }
+            });
+            projectPRsOntoRoads();
+        }
+
+        /* Projette le point (lat,lng) sur le segment [A,B]. Retourne {d, t, projLat, projLng}.
+           d = distance en mètres, t = position relative [0..1] sur le segment. */
+        function projectOnSegment(lat, lng, lat1, lng1, lat2, lng2) {
+            const kx = lngM(lat), ky = LAT_M;
+            const ax = (lng1 - lng) * kx, ay = (lat1 - lat) * ky;
+            const bx = (lng2 - lng) * kx, by = (lat2 - lat) * ky;
+            const abx = bx - ax, aby = by - ay;
+            const ab2 = abx * abx + aby * aby;
+            let t = ab2 > 0 ? ((-ax) * abx + (-ay) * aby) / ab2 : 0;
+            t = Math.max(0, Math.min(1, t));
+            const px = ax + t * abx, py = ay + t * aby;
+            const d = Math.sqrt(px * px + py * py);
+            return { d, t, projLat: lat1 + t * (lat2 - lat1), projLng: lng1 + t * (lng2 - lng1) };
+        }
+
+        /* Pour chaque route, calcule l'abscisse curviligne (s) de chaque segment depuis
+           son origine, puis projette chaque borne PR dessus pour obtenir son s géométrique.
+           Permet ensuite de convertir une position projetée en "PR x + y m". */
+        function projectPRsOntoRoads() {
+            roadGeometry.forEach((segs, route) => {
+                // Abscisse cumulée au début de chaque segment
+                let cum = 0;
+                for (const s of segs) {
+                    s.s0 = cum;
+                    const dx = (s.lng2 - s.lng1) * lngM((s.lat1 + s.lat2) / 2);
+                    const dy = (s.lat2 - s.lat1) * LAT_M;
+                    s.len = Math.sqrt(dx * dx + dy * dy);
+                    cum += s.len;
+                }
+                // Projeter les bornes PR de cette route sur le tracé
+                const prs = routesMap.get(route);
+                if (!prs) return;
+                const projected = [];
+                for (const pr of prs) {
+                    let best = null;
+                    for (const s of segs) {
+                        const r = projectOnSegment(pr.lat, pr.lng, s.lat1, s.lng1, s.lat2, s.lng2);
+                        if (!best || r.d < best.d) {
+                            best = { d: r.d, s: s.s0 + r.t * s.len };
+                        }
+                    }
+                    // On ne garde la borne que si elle tombe près du tracé (<150 m)
+                    if (best && best.d < 150) {
+                        projected.push({ numero: pr.numero, absOff: pr.abscisse, s: best.s, lat: pr.lat, lng: pr.lng });
+                    }
+                }
+                projected.sort((a, b) => a.s - b.s);
+                if (projected.length) prOnRoad.set(route, projected);
+            });
+        }
+
+        /* Dessine toutes les bornes PR en Canvas. Chaque borne est cliquable. */
+        function buildPRMarkers() {
+            if (prMarkersBuilt) return;
+            for (let pr of globalPRRegistry.values()) {
+                const dot = L.circleMarker([pr.lat, pr.lng], {
+                    renderer: prRenderer,
+                    radius: 4,
+                    color: '#f59e0b',
+                    weight: 1,
+                    fillColor: '#f59e0b',
+                    fillOpacity: 0.85
+                });
+                dot.bindPopup(`<b>${pr.route}</b><br>PR ${pr.numero}<br>Abscisse : ${pr.abscisse} m`);
+                dot.bindTooltip(`${pr.route} • PR${pr.numero}`, { direction: 'top', opacity: 0.9 });
+                prLayer.addLayer(dot);
+                prDotByKey.set(`${pr.route}_${pr.numero}`, dot);
+            }
+            prMarkersBuilt = true;
+        }
+
+        /* Masque les bornes en dézoom pour garder la carte lisible et fluide */
+        function toggledPRVisibility() {
+            if (!prMarkersBuilt) return;
+            if (map.getZoom() >= PR_MIN_ZOOM) {
+                if (!map.hasLayer(prLayer)) prLayer.addTo(map);
+            } else {
+                if (map.hasLayer(prLayer)) map.removeLayer(prLayer);
+            }
+        }
+
+        map.on('zoomend', toggledPRVisibility);
+
+        /* Met en vert la borne PR amont utilisée pour le calcul en cours */
+        function highlightActivePR(key) {
+            if (activePRKey === key) return;
+            // Réinitialise l'ancienne borne en orange
+            if (activePRKey && prDotByKey.has(activePRKey)) {
+                prDotByKey.get(activePRKey).setStyle({ color: '#f59e0b', fillColor: '#f59e0b', radius: 4 });
+            }
+            activePRKey = key;
+            if (key && prDotByKey.has(key)) {
+                prDotByKey.get(key).setStyle({ color: '#10b981', fillColor: '#10b981', radius: 7 });
+            }
+        }
+
+        chargerBaseLocale();
+        map.locate({ watch: true, enableHighAccuracy: true, timeout: 15000 });
+
+        map.on('locationerror', () => log('log-gps', `❌ GPS : Signal dégradé ou coupé`, 'red'));
+
+        map.on('locationfound', function(e) {
+            document.getElementById('btn-refresh').classList.remove('searching');
+            const rawLat = e.latlng.lat, rawLng = e.latlng.lng;
+            currentAccuracy = Math.round(e.accuracy);
+
+            // Rejet seulement des positions vraiment inexploitables (> 100 m).
+            // En dessous on affiche toujours quelque chose : le suivi ne doit jamais s'arrêter.
+            if (currentAccuracy > 100) {
+                log('log-gps', `⚠️ GPS : très imprécis (±${currentAccuracy}m)`, 'orange');
+                // on continue quand même avec la position brute plutôt que de tout bloquer
+            }
+
+            // Lissage exponentiel léger (réduit le tremblement sans ajouter de latence visible)
+            if (smoothLat === null) { smoothLat = rawLat; smoothLng = rawLng; }
+            else {
+                // moins on est précis, plus on lisse fort
+                const alpha = currentAccuracy <= 10 ? 0.6 : (currentAccuracy <= 25 ? 0.4 : 0.25);
+                smoothLat = smoothLat + alpha * (rawLat - smoothLat);
+                smoothLng = smoothLng + alpha * (rawLng - smoothLng);
+            }
+            currentLat = smoothLat; currentLng = smoothLng;
+            lastFixTime = Date.now();
+
+            log('log-gps', `📡 GPS : OK (±${currentAccuracy}m)`, currentAccuracy > 20 ? 'orange' : 'green');
+
+            const smoothLatLng = L.latLng(smoothLat, smoothLng);
+            if (userMarker) {
+                userMarker.setLatLng(smoothLatLng);
+                userCircle.setLatLng(smoothLatLng).setRadius(e.accuracy / 2);
+            } else {
+                userMarker = L.circleMarker(smoothLatLng, { color: '#fff', weight: 2, fillColor: '#3b82f6', fillOpacity: 1, radius: 8 }).addTo(map);
+                userCircle = L.circle(smoothLatLng, e.accuracy / 2, { color: '#3b82f6', opacity: 0.1, fillColor: '#3b82f6', fillOpacity: 0.03 }).addTo(map);
+            }
+            if (isInitialFocus) { map.setView(smoothLatLng, 16); isInitialFocus = false; }
+            processLiveLocation(currentLat, currentLng, currentAccuracy);
+        });
+
+        // Bouton : relance une localisation et recentre la carte
+        document.getElementById('btn-refresh').addEventListener('click', function() {
+            this.classList.add('searching');
+            smoothLat = null; smoothLng = null;   // purge le lissage pour repartir propre
+            log('log-gps', `📡 GPS : réactualisation...`, 'blue');
+            map.locate({ setView: true, maxZoom: 16, enableHighAccuracy: true, timeout: 15000 });
+        });
+
+        function processLiveLocation(lat, lng, gpsAccuracy) {
+            // Charge (si besoin) les routes IGN autour de la position — alimente le cache
+            ensureGeometryAround(lat, lng);
+
+            // Si les bornes ne sont pas encore chargées, on n'a rien à calculer,
+            // mais le marqueur GPS s'affiche déjà (géré dans locationfound). On sortira
+            // proprement ici sans figer l'appli.
+            if (globalPRRegistry.size === 0) {
+                updateHUD("CHARGEMENT DES BORNES...", "PR -- + --", "sync");
+                return;
+            }
+
+            // MODE PRÉCIS : projection sur le tracé réel des routes (si géométrie chargée)
+            if (geometryReady) { processWithGeometry(lat, lng, gpsAccuracy); return; }
+
+            // MODE REPLI : ancienne méthode (ligne droite entre bornes) si le tracé manque
+            processWithBornesOnly(lat, lng, gpsAccuracy);
+        }
+
+        /* Calcul précis : on cherche le segment de route le plus proche, on en déduit
+           l'abscisse curviligne, puis le PR amont et le delta réel le long de la courbe. */
+        function processWithGeometry(lat, lng, gpsAccuracy) {
+            const radLat = 1500 / LAT_M, radLng = 1500 / lngM(lat);
+
+            let best = null;   // { route, d, s }
+            roadGeometry.forEach((segs, route) => {
+                for (const s of segs) {
+                    // Filtre grossier : au moins une extrémité dans le rayon
+                    if ((Math.abs(s.lat1 - lat) > radLat || Math.abs(s.lng1 - lng) > radLng) &&
+                        (Math.abs(s.lat2 - lat) > radLat || Math.abs(s.lng2 - lng) > radLng)) continue;
+                    const r = projectOnSegment(lat, lng, s.lat1, s.lng1, s.lat2, s.lng2);
+                    if (!best || r.d < best.d) {
+                        best = { route, d: r.d, s: s.s0 + r.t * s.len, projLat: r.projLat, projLng: r.projLng };
+                    }
+                }
+            });
+
+            const tolerance = Math.min(40, Math.max(20, gpsAccuracy * 1.2));
+
+            if (best && best.d <= tolerance) {
+                // Convertir l'abscisse géométrique en PR amont + delta, via les bornes projetées
+                const prs = prOnRoad.get(best.route);
+                let label;
+                if (prs && prs.length) {
+                    // Trouver la borne PR juste en amont (s <= position)
+                    let base = prs[0];
+                    for (const p of prs) { if (p.s <= best.s) base = p; else break; }
+                    const delta = Math.round(best.s - base.s);
+                    label = `PR ${base.numero} + ${delta} m`;
+                    highlightActivePR(`${best.route}_${base.numero}`);
+                } else {
+                    label = `PR ? + ${Math.round(best.s)} m`;
+                    highlightActivePR(null);
+                }
+                const d = Math.round(best.d);
+                let conf, cls;
+                if (d <= 10) { conf = "● fiable"; cls = "on"; }
+                else if (d <= 25) { conf = "◐ moyen"; cls = "on"; }
+                else { conf = "○ approx."; cls = "sync"; }
+                updateHUD(`${best.route} • ${conf} (±${d}m route)`, label, cls);
+            } else {
+                // Pas de tracé exploitable ici (zone pas encore chargée, ou route absente
+                // de la BD TOPO) : on NE lâche PAS le suivi, on retombe sur les bornes.
+                processWithBornesOnly(lat, lng, gpsAccuracy);
+            }
+        }
+
+        /* Repli sans géométrie : projection en ligne droite entre bornes consécutives. */
+        function processWithBornesOnly(lat, lng, gpsAccuracy) {
+            const LAT_TO_METER = 111120;
+            const LNG_TO_METER = 111120 * Math.cos(lat * Math.PI / 180);
+            const SEARCH_RADIUS = 1500;
+            const radLat = SEARCH_RADIUS / LAT_TO_METER;
+            const radLng = SEARCH_RADIUS / LNG_TO_METER;
+
+            let bestRoadMatch = null;
+            let minCalculatedDistance = Infinity;
+
+            routesMap.forEach((allPoints, routeName) => {
+                const points = allPoints.filter(p =>
+                    Math.abs(p.lat - lat) <= radLat && Math.abs(p.lng - lng) <= radLng);
+                if (points.length < 2) return;
+                for (let i = 0; i < points.length - 1; i++) {
+                    const pMin = points[i], pMax = points[i + 1];
+                    if (pMax.abscisse - pMin.abscisse > 2500) continue;
+                    const ax = (pMin.lng - lng) * LNG_TO_METER, ay = (pMin.lat - lat) * LAT_TO_METER;
+                    const bx = (pMax.lng - lng) * LNG_TO_METER, by = (pMax.lat - lat) * LAT_TO_METER;
+                    const abx = bx - ax, aby = by - ay;
+                    const ab2 = abx * abx + aby * aby;
+                    let t = ab2 > 0 ? ((-ax) * abx + (-ay) * aby) / ab2 : 0;
+                    t = Math.max(0, Math.min(1, t));
+                    const projX = ax + t * abx, projY = ay + t * aby;
+                    const distanceToRoad = Math.sqrt(projX * projX + projY * projY);
+                    if (distanceToRoad < minCalculatedDistance) {
+                        minCalculatedDistance = distanceToRoad;
+                        const realAbscisse = pMin.abscisse + t * (pMax.abscisse - pMin.abscisse);
+                        bestRoadMatch = {
+                            route: routeName, prBase: pMin.numero,
+                            abscisse: Math.round(realAbscisse - pMin.abscisse),
+                            distance: distanceToRoad
+                        };
+                    }
+                }
+            });
+
+            const segmentTolerance = Math.min(40, Math.max(20, gpsAccuracy * 1.2));
+            if (bestRoadMatch && bestRoadMatch.distance <= segmentTolerance) {
+                const lat_m = Math.round(bestRoadMatch.distance);
+                let conf, cls;
+                if (lat_m <= 12) { conf = "● fiable"; cls = "on"; }
+                else if (lat_m <= 25) { conf = "◐ moyen"; cls = "on"; }
+                else { conf = "○ approx."; cls = "sync"; }
+                updateHUD(`${bestRoadMatch.route} • ${conf} (±${lat_m}m) [bornes]`,
+                          `PR ${bestRoadMatch.prBase} + ${bestRoadMatch.abscisse} m`, cls);
+                highlightActivePR(`${bestRoadMatch.route}_${bestRoadMatch.prBase}`);
+            } else {
+                updateHUD("HORS RÉSEAU DÉPARTEMENTAL", "PR -- + --", "off");
+                highlightActivePR(null);
+            }
+        }
+
+        function updateHUD(title, value, status) {
+            document.getElementById('hud-title').innerText = title;
+            document.getElementById('hud-value').innerText = value;
+            document.getElementById('hud-panel').className = "pr-panel " + status;
+        }
+        function log(id, text, colorClass) {
+            const el = document.getElementById(id);
+            if (el) { el.innerText = text; el.className = `text-${colorClass}`; }
+        }
+    </script>
+</body>
+</html>
